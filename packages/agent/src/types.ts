@@ -58,7 +58,7 @@ export type QueueMode = "all" | "one-at-a-time";
 export type AgentToolCall = Extract<AssistantMessage["content"][number], { type: "toolCall" }>;
 
 /**
- * Result returned from `beforeToolCall`.
+ * Result returned from `beforeToolCall` or `beforeToolExecute`.
  *
  * Returning `{ block: true }` prevents the tool from executing. The loop emits an error tool result instead.
  * `reason` becomes the text shown in that error result. If omitted, a default blocked message is used.
@@ -99,13 +99,13 @@ export interface AfterToolCallResult {
 	terminate?: boolean;
 }
 
-/** Context passed to `beforeToolCall`. */
+/** Context passed to `beforeToolCall` and `beforeToolExecute`. */
 export interface BeforeToolCallContext {
 	/** The assistant message that requested the tool call. */
 	assistantMessage: AssistantMessage;
-	/** The raw tool call block from `assistantMessage.content`. */
+	/** Raw call for `beforeToolCall`; deeply frozen final-argument snapshot for `beforeToolExecute`. */
 	toolCall: AgentToolCall;
-	/** Validated tool arguments for the target tool schema. */
+	/** Validated arguments. Mutable in `beforeToolCall`; deeply frozen snapshot in `beforeToolExecute`. */
 	args: unknown;
 	/** Current agent context at the time the tool call is prepared. */
 	context: AgentContext;
@@ -313,13 +313,27 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	toolExecution?: ToolExecutionMode;
 
 	/**
-	 * Called before a tool is executed, after arguments have been validated.
+	 * Called after initial argument validation. Argument changes are freshly validated and isolated before execution.
 	 *
 	 * Return `{ block: true }` to prevent execution. The loop emits an error tool result instead.
 	 * A blocked result can also set `terminate: true` to participate in the batch early-termination rule.
 	 * The hook receives the agent abort signal and is responsible for honoring it.
 	 */
 	beforeToolCall?: (context: BeforeToolCallContext, signal?: AbortSignal) => Promise<BeforeToolCallResult | undefined>;
+
+	/**
+	 * Final execution guard, called after `beforeToolCall` transformations and fresh schema validation.
+	 *
+	 * `args` and `toolCall` are deeply frozen snapshots of the final isolated execution input;
+	 * the surrounding agent context is not frozen. This hook cannot rewrite execution input.
+	 * Return `{ block: true }` to emit an error tool result without executing the tool.
+	 * `reason` and `terminate` have the same semantics as in `beforeToolCall`.
+	 * Errors block execution, and cancellation is checked again after the hook settles.
+	 */
+	beforeToolExecute?: (
+		context: BeforeToolCallContext,
+		signal?: AbortSignal,
+	) => Promise<BeforeToolCallResult | undefined>;
 
 	/**
 	 * Called after a tool finishes executing, before `tool_execution_end` and tool-result message events are emitted.

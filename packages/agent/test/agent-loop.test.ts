@@ -8,6 +8,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
+import { Agent } from "../src/agent.ts";
 import { agentLoop, agentLoopContinue, runAgentLoop } from "../src/agent-loop.ts";
 import { setDefaultStreamFn } from "../src/index.ts";
 import type { AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentTool } from "../src/types.ts";
@@ -477,66 +478,301 @@ describe("agentLoop with AgentMessage", () => {
 		expect(messages[messages.length - 1].role).toBe("assistant");
 	});
 
-	it("should execute mutated beforeToolCall args without revalidation", async () => {
-		const toolSchema = Type.Object({ value: Type.String() });
-		const executed: Array<string | number> = [];
-		const tool: AgentTool<typeof toolSchema, { value: string | number }> = {
-			name: "echo",
-			label: "Echo",
-			description: "Echo tool",
-			parameters: toolSchema,
-			async execute(_toolCallId, params) {
-				executed.push(params.value as string | number);
-				return {
-					content: [{ type: "text", text: `echoed: ${String(params.value)}` }],
-					details: { value: params.value as string | number },
-				};
-			},
-		};
-
-		const context: AgentContext = {
-			messages: [],
-			tools: [tool],
-		};
-
-		const userPrompt: AgentMessage = createUserMessage("echo something");
-
-		const config: AgentLoopConfig = {
-			model: createModel(),
-			convertToLlm: identityConverter,
-			beforeToolCall: async ({ args }) => {
-				const mutableArgs = args as { value: string | number };
-				mutableArgs.value = 123;
-				return undefined;
-			},
-		};
-
-		let callIndex = 0;
-		const streamFn = () => {
-			const stream = new MockAssistantStream();
-			queueMicrotask(() => {
-				if (callIndex === 0) {
-					const message = createAssistantMessage(
-						[{ type: "toolCall", id: "tool-1", name: "echo", arguments: { value: "hello" } }],
-						"toolUse",
-					);
-					stream.push({ type: "done", reason: "toolUse", message });
-				} else {
-					const message = createAssistantMessage([{ type: "text", text: "done" }]);
-					stream.push({ type: "done", reason: "stop", message });
-				}
-				callIndex++;
+	it.each(["sequential", "parallel"] as const)(
+		"blocks schema-invalid beforeToolCall mutations before effects in %s mode",
+		async (toolExecution) => {
+			const toolSchema = Type.Object({ value: Type.String() });
+			let executions = 0;
+			let guardCalls = 0;
+			const tool: AgentTool<typeof toolSchema, undefined> = {
+				name: "echo",
+				label: "Echo",
+				description: "Echo tool",
+				parameters: toolSchema,
+				async execute() {
+					executions++;
+					return { content: [], details: undefined };
+				},
+			};
+			const agent = new Agent({
+				initialState: { model: createModel(), tools: [tool] },
+				toolExecution,
+				beforeToolCall: async ({ args }) => {
+					if (args && typeof args === "object" && "value" in args) args.value = { invalid: true };
+					return undefined;
+				},
+				beforeToolExecute: async () => {
+					guardCalls++;
+					return undefined;
+				},
+				finishTurn: () => ({ action: "end" }),
+				streamFn: () => {
+					const response = new MockAssistantStream();
+					queueMicrotask(() => {
+						response.push({
+							type: "done",
+							reason: "toolUse",
+							message: createAssistantMessage(
+								[{ type: "toolCall", id: "tool-1", name: "echo", arguments: { value: "hello" } }],
+								"toolUse",
+							),
+						});
+					});
+					return response;
+				},
 			});
-			return stream;
-		};
 
-		const stream = agentLoop([userPrompt], context, config, undefined, streamFn);
-		for await (const _event of stream) {
-			// consume
-		}
+			await agent.prompt("echo");
 
-		expect(executed).toEqual([123]);
-	});
+			expect(executions).toBe(0);
+			expect(guardCalls).toBe(0);
+			const result = agent.state.messages.find((message) => message.role === "toolResult");
+			expect(result?.role === "toolResult" ? result.isError : false).toBe(true);
+			expect(result?.content).toEqual([
+				{ type: "text", text: expect.stringContaining('Validation failed for tool "echo"') },
+			]);
+		},
+	);
+
+	it.each(["beforeToolCall", "beforeToolExecute"] as const)(
+		"turns %s errors into tool-result failures without execution",
+		async (hook) => {
+			const toolSchema = Type.Object({});
+			let executions = 0;
+			const tool: AgentTool<typeof toolSchema, undefined> = {
+				name: "echo",
+				label: "Echo",
+				description: "Echo tool",
+				parameters: toolSchema,
+				async execute() {
+					executions++;
+					return { content: [], details: undefined };
+				},
+			};
+			const agent = new Agent({
+				initialState: { model: createModel(), tools: [tool] },
+				[hook]: async () => {
+					throw new Error("Guard failed closed");
+				},
+				finishTurn: () => ({ action: "end" }),
+				streamFn: () => {
+					const response = new MockAssistantStream();
+					queueMicrotask(() => {
+						response.push({
+							type: "done",
+							reason: "toolUse",
+							message: createAssistantMessage(
+								[{ type: "toolCall", id: "tool-1", name: "echo", arguments: {} }],
+								"toolUse",
+							),
+						});
+					});
+					return response;
+				},
+			});
+
+			await agent.prompt("echo");
+
+			expect(executions).toBe(0);
+			const result = agent.state.messages.find((message) => message.role === "toolResult");
+			expect(result?.role === "toolResult" ? result.isError : false).toBe(true);
+			expect(result?.content).toEqual([{ type: "text", text: "Guard failed closed" }]);
+		},
+	);
+
+	it.each(["sequential", "parallel"] as const)(
+		"runs the final guard on immutable rewritten input and prevents denied effects in %s mode",
+		async (toolExecution) => {
+			const toolSchema = Type.Object({ nested: Type.Object({ values: Type.Array(Type.String()) }) });
+			const executed: string[][] = [];
+			const observed: unknown[] = [];
+			const frozen: boolean[] = [];
+			const tool: AgentTool<typeof toolSchema, undefined> = {
+				name: "echo",
+				label: "Echo",
+				description: "Echo tool",
+				parameters: toolSchema,
+				prepareArguments() {
+					return { nested: { values: ["prepared"] } };
+				},
+				async execute(_id, params) {
+					executed.push(params.nested.values);
+					return { content: [], details: undefined };
+				},
+			};
+			const agent = new Agent({
+				initialState: { model: createModel(), tools: [tool] },
+				toolExecution,
+				beforeToolCall: async (context) => {
+					// Replacing args is also a supported mutable transformation.
+					context.args = { nested: { values: [context.toolCall.id] } };
+					return undefined;
+				},
+				beforeToolExecute: async ({ toolCall, args, context }) => {
+					const input = args as { nested: { values: string[] } };
+					observed.push(args, toolCall.arguments);
+					frozen.push(
+						Object.isFrozen(toolCall),
+						Object.isFrozen(args),
+						Object.isFrozen(input.nested),
+						Object.isFrozen(input.nested.values),
+						!Object.isFrozen(context),
+						!Object.isFrozen(context.messages),
+						!Reflect.set(input.nested.values, "0", "tampered"),
+					);
+					return toolCall.id === "denied" ? { block: true, reason: "Final policy denied" } : undefined;
+				},
+				finishTurn: () => ({ action: "end" }),
+				streamFn: () => {
+					const response = new MockAssistantStream();
+					queueMicrotask(() => {
+						response.push({
+							type: "done",
+							reason: "toolUse",
+							message: createAssistantMessage(
+								[
+									{ type: "toolCall", id: "allowed", name: "echo", arguments: {} },
+									{ type: "toolCall", id: "denied", name: "echo", arguments: {} },
+								],
+								"toolUse",
+							),
+						});
+					});
+					return response;
+				},
+			});
+
+			await agent.prompt("echo");
+
+			expect(executed).toEqual([["allowed"]]);
+			expect(observed).toEqual([
+				{ nested: { values: ["allowed"] } },
+				{ nested: { values: ["allowed"] } },
+				{ nested: { values: ["denied"] } },
+				{ nested: { values: ["denied"] } },
+			]);
+			expect(frozen).toEqual(Array.from({ length: 14 }, () => true));
+			const results = agent.state.messages.filter((message) => message.role === "toolResult");
+			expect(results.map((result) => result.isError)).toEqual([false, true]);
+			expect(results[1].content).toEqual([{ type: "text", text: "Final policy denied" }]);
+		},
+	);
+
+	it.each(["sequential", "parallel"] as const)(
+		"isolates execution from retained mutable arguments while awaiting the final guard in %s mode",
+		async (toolExecution) => {
+			const toolSchema = Type.Object({ nested: Type.Object({ value: Type.String() }) });
+			const original = { nested: { value: "original" } };
+			let retained: { nested: { value: string } } | undefined;
+			const executed: string[] = [];
+			let observed: unknown;
+			const tool: AgentTool<typeof toolSchema, undefined> = {
+				name: "echo",
+				label: "Echo",
+				description: "Echo tool",
+				parameters: toolSchema,
+				async execute(_id, params) {
+					executed.push(params.nested.value);
+					return { content: [], details: undefined };
+				},
+			};
+			const agent = new Agent({
+				initialState: { model: createModel(), tools: [tool] },
+				toolExecution,
+				beforeToolCall: async ({ args }) => {
+					retained = args as { nested: { value: string } };
+					retained.nested.value = "rewritten";
+					return undefined;
+				},
+				beforeToolExecute: async ({ args }) => {
+					await Promise.resolve();
+					original.nested.value = "late raw mutation";
+					if (retained) retained.nested.value = "late hook mutation";
+					observed = args;
+					return undefined;
+				},
+				finishTurn: () => ({ action: "end" }),
+				streamFn: () => {
+					const response = new MockAssistantStream();
+					queueMicrotask(() => {
+						response.push({
+							type: "done",
+							reason: "toolUse",
+							message: createAssistantMessage(
+								[{ type: "toolCall", id: "tool-1", name: "echo", arguments: original }],
+								"toolUse",
+							),
+						});
+					});
+					return response;
+				},
+			});
+
+			await agent.prompt("echo");
+
+			expect(observed).toEqual({ nested: { value: "rewritten" } });
+			expect(executed).toEqual(["rewritten"]);
+			expect(retained?.nested.value).toBe("late hook mutation");
+		},
+	);
+
+	it.each(["sequential", "parallel"] as const)(
+		"does not execute after cancellation while awaiting the final guard in %s mode",
+		async (toolExecution) => {
+			const toolSchema = Type.Object({});
+			let executions = 0;
+			let guardSignal: AbortSignal | undefined;
+			const { promise: guardEntered, resolve: enterGuard } = Promise.withResolvers<void>();
+			const { promise: guardReleased, resolve: releaseGuard } = Promise.withResolvers<void>();
+			const tool: AgentTool<typeof toolSchema, undefined> = {
+				name: "echo",
+				label: "Echo",
+				description: "Echo tool",
+				parameters: toolSchema,
+				async execute() {
+					executions++;
+					return { content: [], details: undefined };
+				},
+			};
+			const agent = new Agent({
+				initialState: { model: createModel(), tools: [tool] },
+				toolExecution,
+				beforeToolExecute: async (_context, signal) => {
+					guardSignal = signal;
+					enterGuard();
+					await guardReleased;
+					return undefined;
+				},
+				finishTurn: () => ({ action: "end" }),
+				streamFn: () => {
+					const response = new MockAssistantStream();
+					queueMicrotask(() => {
+						response.push({
+							type: "done",
+							reason: "toolUse",
+							message: createAssistantMessage(
+								[{ type: "toolCall", id: "tool-1", name: "echo", arguments: {} }],
+								"toolUse",
+							),
+						});
+					});
+					return response;
+				},
+			});
+
+			const run = agent.prompt("echo");
+			await guardEntered;
+			agent.abort();
+			releaseGuard();
+			await run;
+
+			expect(guardSignal?.aborted).toBe(true);
+			expect(executions).toBe(0);
+			const result = agent.state.messages.find((message) => message.role === "toolResult");
+			expect(result?.role === "toolResult" ? result.isError : false).toBe(true);
+			expect(result?.content).toEqual([{ type: "text", text: "Operation aborted" }]);
+		},
+	);
 
 	it("should prepare tool arguments for validation", async () => {
 		const replaceSchema = Type.Object({ oldText: Type.String(), newText: Type.String() });
@@ -1732,63 +1968,66 @@ describe("agentLoop with AgentMessage", () => {
 		expect(events.filter((event) => event.type === "turn_end")).toHaveLength(1);
 	});
 
-	it("should stop after a blocked tool call when beforeToolCall sets terminate=true", async () => {
-		const toolSchema = Type.Object({ value: Type.String() });
-		let executed = false;
-		const tool: AgentTool<typeof toolSchema, { value: string }> = {
-			name: "echo",
-			label: "Echo",
-			description: "Echo tool",
-			parameters: toolSchema,
-			async execute() {
-				executed = true;
-				return {
-					content: [{ type: "text", text: "should not execute" }],
-					details: { value: "unexpected" },
-				};
-			},
-		};
-		const context: AgentContext = {
-			messages: [],
-			tools: [tool],
-		};
-		const config: AgentLoopConfig = {
-			model: createModel(),
-			convertToLlm: identityConverter,
-			beforeToolCall: async () => ({ block: true, reason: "Blocked by policy", terminate: true }),
-		};
+	it.each(["beforeToolCall", "beforeToolExecute"] as const)(
+		"stops when %s blocks with terminate=true",
+		async (hook) => {
+			const toolSchema = Type.Object({ value: Type.String() });
+			let executed = false;
+			const tool: AgentTool<typeof toolSchema, { value: string }> = {
+				name: "echo",
+				label: "Echo",
+				description: "Echo tool",
+				parameters: toolSchema,
+				async execute() {
+					executed = true;
+					return {
+						content: [{ type: "text", text: "should not execute" }],
+						details: { value: "unexpected" },
+					};
+				},
+			};
+			const context: AgentContext = {
+				messages: [],
+				tools: [tool],
+			};
+			const config: AgentLoopConfig = {
+				model: createModel(),
+				convertToLlm: identityConverter,
+				[hook]: async () => ({ block: true, reason: "Blocked by policy", terminate: true }),
+			};
 
-		let llmCalls = 0;
-		const stream = agentLoop([createUserMessage("echo something")], context, config, undefined, () => {
-			llmCalls++;
-			const mockStream = new MockAssistantStream();
-			queueMicrotask(() => {
-				const message =
-					llmCalls === 1
-						? createAssistantMessage(
-								[{ type: "toolCall", id: "tool-1", name: "echo", arguments: { value: "hello" } }],
-								"toolUse",
-							)
-						: createAssistantMessage([{ type: "text", text: "should not run" }]);
-				mockStream.push({ type: "done", reason: llmCalls === 1 ? "toolUse" : "stop", message });
+			let llmCalls = 0;
+			const stream = agentLoop([createUserMessage("echo something")], context, config, undefined, () => {
+				llmCalls++;
+				const mockStream = new MockAssistantStream();
+				queueMicrotask(() => {
+					const message =
+						llmCalls === 1
+							? createAssistantMessage(
+									[{ type: "toolCall", id: "tool-1", name: "echo", arguments: { value: "hello" } }],
+									"toolUse",
+								)
+							: createAssistantMessage([{ type: "text", text: "should not run" }]);
+					mockStream.push({ type: "done", reason: llmCalls === 1 ? "toolUse" : "stop", message });
+				});
+				return mockStream;
 			});
-			return mockStream;
-		});
 
-		for await (const _event of stream) {
-			// consume
-		}
+			for await (const _event of stream) {
+				// consume
+			}
 
-		const messages = await stream.result();
-		const toolResult = messages.find((message) => message.role === "toolResult");
-		expect(executed).toBe(false);
-		expect(llmCalls).toBe(1);
-		expect(toolResult?.role === "toolResult" ? toolResult.isError : false).toBe(true);
-		expect(toolResult?.role === "toolResult" ? toolResult.content : []).toContainEqual({
-			type: "text",
-			text: "Blocked by policy",
-		});
-	});
+			const messages = await stream.result();
+			const toolResult = messages.find((message) => message.role === "toolResult");
+			expect(executed).toBe(false);
+			expect(llmCalls).toBe(1);
+			expect(toolResult?.role === "toolResult" ? toolResult.isError : false).toBe(true);
+			expect(toolResult?.role === "toolResult" ? toolResult.content : []).toContainEqual({
+				type: "text",
+				text: "Blocked by policy",
+			});
+		},
+	);
 
 	it("should continue after a mixed batch with one terminating blocked call", async () => {
 		const toolSchema = Type.Object({ value: Type.String() });

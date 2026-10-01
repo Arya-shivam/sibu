@@ -123,7 +123,7 @@ In parallel mode, tool completion events follow tool completion order, but persi
 
 The mode can be set globally via `toolExecution` in the agent config, or per-tool via `executionMode` on `AgentTool`. If any tool call in a batch targets a tool with `executionMode: "sequential"`, the entire batch executes sequentially regardless of the global setting.
 
-The `beforeToolCall` hook runs after `tool_execution_start` and validated argument parsing. It can block execution and attach `terminate: true` to the blocked result. The `afterToolCall` hook runs after tool execution finishes and before `tool_execution_end` and final tool result message events are emitted.
+The `beforeToolCall` hook runs after `tool_execution_start` and validated argument parsing. It can rewrite arguments or block execution and attach `terminate: true` to the blocked result. Rewritten arguments are freshly validated and isolated from retained mutable references. Optional `beforeToolExecute` then receives deeply frozen `args` and `toolCall` snapshots for a final deny-only decision; the live agent context remains unfrozen. Blocking, throwing, or cancellation prevents the tool effect. The tool executes the final validated arguments, not a later mutation of the original input. The `afterToolCall` hook runs after tool execution finishes and before `tool_execution_end` and final tool result message events are emitted.
 
 Tools, blocked `beforeToolCall` results, and `afterToolCall` overrides can return `terminate: true` to hint that the automatic follow-up LLM call should be skipped. The loop only stops early when every finalized tool result in that batch sets `terminate: true`. Mixed batches continue normally.
 
@@ -253,6 +253,11 @@ const agent = new Agent({
     }
   },
 
+  // Final deny-only decision after argument rewrites and revalidation.
+  beforeToolExecute: async ({ toolCall, args }, signal) => {
+    if (toolCall.name === "bash") return { block: true, reason: "Shell disabled" };
+  },
+
   // Postprocess each tool result before final tool events are emitted.
   afterToolCall: async ({ toolCall, result, isError, context }) => {
     if (toolCall.name === "notify_done" && !isError) {
@@ -347,6 +352,7 @@ agent.state.thinkingLevel = "medium";
 agent.state.tools = [myTool];
 agent.toolExecution = "sequential";
 agent.beforeToolCall = async ({ toolCall }) => undefined;
+agent.beforeToolExecute = async ({ toolCall, args }) => undefined;
 agent.afterToolCall = async ({ toolCall, result }) => undefined;
 agent.prepareRequest = async ({ context }) => ({
   context: { ...context, messages: await loadCanonicalMessages() },
@@ -545,6 +551,7 @@ const config: AgentLoopConfig = {
   convertToLlm: (msgs) => msgs.filter(m => ["user", "assistant", "toolResult"].includes(m.role)),
   toolExecution: "parallel",  // overridden by per-tool executionMode if set
   beforeToolCall: async ({ toolCall, args, context }) => undefined,
+  beforeToolExecute: async ({ toolCall, args, context }) => undefined,
   afterToolCall: async ({ toolCall, result, isError, context }) => undefined,
 };
 

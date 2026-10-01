@@ -24,6 +24,7 @@ import type {
 	AgentTool,
 	AgentToolCall,
 	AgentToolResult,
+	BeforeToolCallContext,
 	PrepareNextTurnContext,
 	StreamFn,
 } from "./types.ts";
@@ -700,6 +701,14 @@ function prepareToolCallArguments(tool: AgentTool<any>, toolCall: AgentToolCall)
 	};
 }
 
+/** Freeze only the isolated execution input, never the live agent context. */
+function freezeToolInput<T>(value: T): T {
+	if (typeof value !== "object" || value === null || Object.isFrozen(value)) return value;
+	Object.freeze(value);
+	for (const child of Object.values(value)) freezeToolInput(child);
+	return value;
+}
+
 async function prepareToolCall(
 	currentContext: AgentContext,
 	assistantMessage: AssistantMessage,
@@ -719,16 +728,14 @@ async function prepareToolCall(
 	try {
 		const preparedToolCall = prepareToolCallArguments(tool, toolCall);
 		const validatedArgs = validateToolArguments(tool, preparedToolCall);
+		const beforeContext: BeforeToolCallContext = {
+			assistantMessage,
+			toolCall,
+			args: validatedArgs,
+			context: currentContext,
+		};
 		if (config.beforeToolCall) {
-			const beforeResult = await config.beforeToolCall(
-				{
-					assistantMessage,
-					toolCall,
-					args: validatedArgs,
-					context: currentContext,
-				},
-				signal,
-			);
+			const beforeResult = await config.beforeToolCall(beforeContext, signal);
 			if (signal?.aborted) {
 				return {
 					kind: "immediate",
@@ -748,6 +755,29 @@ async function prepareToolCall(
 				};
 			}
 		}
+		// Validation clones its input, severing references retained by mutable tool-call hooks.
+		const args = validateToolArguments(tool, {
+			...toolCall,
+			arguments: beforeContext.args as AgentToolCall["arguments"],
+		});
+		const executionToolCall = { ...toolCall, name: tool.name, arguments: args as AgentToolCall["arguments"] };
+		if (config.beforeToolExecute && !signal?.aborted) {
+			const snapshot = freezeToolInput(structuredClone(executionToolCall));
+			const beforeResult = await config.beforeToolExecute(
+				{
+					assistantMessage,
+					toolCall: snapshot,
+					args: snapshot.arguments,
+					context: currentContext,
+				},
+				signal,
+			);
+			if (!signal?.aborted && beforeResult?.block) {
+				const result = createErrorToolResult(beforeResult.reason || "Tool execution was blocked");
+				if (beforeResult.terminate === true) result.terminate = true;
+				return { kind: "immediate", result, isError: true };
+			}
+		}
 		if (signal?.aborted) {
 			return {
 				kind: "immediate",
@@ -757,9 +787,9 @@ async function prepareToolCall(
 		}
 		return {
 			kind: "prepared",
-			toolCall,
+			toolCall: executionToolCall,
 			tool,
-			args: validatedArgs,
+			args,
 		};
 	} catch (error) {
 		return {
