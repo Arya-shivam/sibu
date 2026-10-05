@@ -2,6 +2,8 @@
  * Extension runner - executes extensions and manages their lifecycle.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
+import { randomUUID } from "node:crypto";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import {
 	getCurrentSystemMessage,
@@ -24,6 +26,7 @@ import {
 	type NormalizedBuildSystemPromptOptions,
 	normalizeBuildSystemPromptOptions,
 } from "../system-prompt.ts";
+import { disposeExtensionCleanups, isExtensionCleanupRunning } from "./cleanup.ts";
 import type {
 	AgentBeforeSettleEvent,
 	BeforeAgentStartEvent,
@@ -40,6 +43,10 @@ import type {
 	ContextUsage,
 	ContextWithSystemEvent,
 	EntryRenderer,
+	ExecutionEvent,
+	ExecutionGuardEvent,
+	ExecutionGuardEventResult,
+	ExecutionRequest,
 	Extension,
 	ExtensionActions,
 	ExtensionCommandContext,
@@ -172,6 +179,8 @@ interface BeforeAgentStartCombinedResult {
 type RunnerEmitEvent = Exclude<
 	ExtensionEvent,
 	| ToolCallEvent
+	| ExecutionGuardEvent
+	| ExecutionEvent
 	| ProjectTrustEvent
 	| ToolResultEvent
 	| UserBashEvent
@@ -248,22 +257,58 @@ export type ReloadHandler = () => Promise<void>;
 export type ShutdownHandler = () => void;
 
 /**
- * Helper function to emit session_shutdown event to extensions.
- * Returns true if the event was emitted, false if there were no handlers.
+ * Emit session_shutdown once per runner, then await all owned resource cleanup.
+ * Returns whether the first shutdown request had any handlers.
  */
-export async function emitSessionShutdownEvent(
+export function emitSessionShutdownEvent(
 	extensionRunner: ExtensionRunner,
 	event: SessionShutdownEvent,
 ): Promise<boolean> {
-	if (extensionRunner.hasHandlers("session_shutdown")) {
-		await extensionRunner.emit(event);
-		return true;
-	}
-	return false;
+	return extensionRunner.emitSessionShutdownEvent(event);
 }
 
 function snapshotEventHandlers(extensions: Extension[], event: ExtensionEvent["type"]) {
 	return extensions.map((ext) => ({ ext, handlers: ext.handlers.get(event)?.slice() ?? [] }));
+}
+
+const executionGuardContext = new AsyncLocalStorage<boolean>();
+const executionObserverContext = new AsyncLocalStorage<boolean>();
+
+function executionErrorMessage(error: unknown): string {
+	try {
+		return error instanceof Error ? error.message : String(error);
+	} catch {
+		return "Execution failed with an unreadable error.";
+	}
+}
+
+function freezeExecutionSnapshot<T>(value: T): T {
+	if (typeof value !== "object" || value === null || Object.isFrozen(value)) return value;
+	const prototype = Object.getPrototypeOf(value);
+	if (!Array.isArray(value) && prototype !== Object.prototype && prototype !== null) {
+		throw new Error("Execution guard snapshots support only plain objects and arrays.");
+	}
+	Object.freeze(value);
+	for (const child of Object.values(value)) freezeExecutionSnapshot(child);
+	return value;
+}
+
+function parseExecutionGuardResult(value: unknown): ExecutionGuardEventResult | undefined {
+	if (value === undefined) return undefined;
+	if (typeof value !== "object" || value === null || Array.isArray(value)) {
+		throw new Error("Invalid execution_guard result: return undefined or { block?: boolean, reason?: string }.");
+	}
+	const candidate = value as Record<string, unknown>;
+	const block = candidate.block;
+	const reason = candidate.reason;
+	if (
+		(block !== undefined && typeof block !== "boolean") ||
+		(reason !== undefined && typeof reason !== "string") ||
+		Object.keys(candidate).some((key) => key !== "block" && key !== "reason")
+	) {
+		throw new Error("Invalid execution_guard result: return undefined or { block?: boolean, reason?: string }.");
+	}
+	return { block, reason };
 }
 
 function sameMessages(left: AgentMessage[], right: AgentMessage[]): boolean {
@@ -381,6 +426,9 @@ export class ExtensionRunner {
 	private shortcutDiagnostics: ResourceDiagnostic[] = [];
 	private commandDiagnostics: ResourceDiagnostic[] = [];
 	private staleMessage: string | undefined;
+	private disposalPromise: Promise<void> | undefined;
+	private sessionShutdownPromise: Promise<boolean> | undefined;
+	private executionGuardBound = false;
 	private uiPromptDepth = 0;
 	private activeUIPrompt: { kind: UIPromptKind; title?: string } | undefined;
 
@@ -498,6 +546,11 @@ export class ExtensionRunner {
 			}
 			this.modelRegistry.unregisterProvider(name);
 		};
+		this.executionGuardBound = true;
+		this.runtime.guardExecution = (execution, signal, executionId) =>
+			this.guardExecution(execution, signal, executionId);
+		this.runtime.observeExecution = (execution, operation, signal, executionId) =>
+			this.observeExecution(execution, operation, signal, executionId);
 	}
 
 	bindCommandContext(actions?: ExtensionCommandContextActions): void {
@@ -683,6 +736,49 @@ export class ExtensionRunner {
 			this.staleMessage = message;
 			this.runtime.invalidate(message);
 		}
+		void this.dispose().catch(() => {});
+	}
+
+	emitSessionShutdownEvent(event: SessionShutdownEvent): Promise<boolean> {
+		if (isExtensionCleanupRunning(this.runtime)) {
+			return Promise.reject(new Error("Cannot shut down an extension runtime from its cleanup callback."));
+		}
+		if (this.sessionShutdownPromise) return this.sessionShutdownPromise;
+
+		const hasHandlers = this.hasHandlers("session_shutdown");
+		this.sessionShutdownPromise = Promise.resolve().then(async () => {
+			try {
+				if (hasHandlers) await this.emit(event);
+				return hasHandlers;
+			} finally {
+				await this.dispose();
+			}
+		});
+		return this.sessionShutdownPromise;
+	}
+
+	/** Dispose owned resources once, reporting each failure without interrupting cleanup. */
+	dispose(): Promise<void> {
+		if (isExtensionCleanupRunning(this.runtime)) {
+			return Promise.reject(new Error("Cannot dispose an extension runtime from its cleanup callback."));
+		}
+		if (this.disposalPromise) return this.disposalPromise;
+
+		this.disposalPromise = disposeExtensionCleanups(this.runtime).then((failures) => {
+			for (const { extensionPath, error } of failures) {
+				try {
+					this.emitError({
+						extensionPath,
+						event: "cleanup",
+						error: error instanceof Error ? error.message : String(error),
+						stack: error instanceof Error ? error.stack : undefined,
+					});
+				} catch {
+					// A failing error listener must not suppress other cleanup failures.
+				}
+			}
+		});
+		return this.disposalPromise;
 	}
 
 	private assertActive(): void {
@@ -1129,6 +1225,229 @@ export class ExtensionRunner {
 			isError: currentEvent.isError,
 			usage: currentEvent.usage,
 		};
+	}
+
+	/** Report observer failures without allowing even an error listener to affect execution. */
+	private reportExecutionObserverError(extensionPath: string, error: unknown): void {
+		try {
+			executionObserverContext.run(true, () =>
+				this.emitError({
+					extensionPath,
+					event: "execution",
+					error: executionErrorMessage(error),
+					stack: error instanceof Error ? error.stack : undefined,
+				}),
+			);
+		} catch {
+			// Error reporting is observational too.
+		}
+	}
+
+	private snapshotObservedExecution(execution: ExecutionRequest): ExecutionRequest | undefined {
+		try {
+			return freezeExecutionSnapshot(structuredClone(execution));
+		} catch (error) {
+			this.reportExecutionObserverError("<execution>", error);
+			return undefined;
+		}
+	}
+
+	private async notifyExecution(event: ExecutionEvent): Promise<void> {
+		try {
+			const frozenEvent = Object.freeze(event);
+			const ctx = this.createContext();
+			await executionObserverContext.run(true, async () => {
+				for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "execution")) {
+					for (const handler of handlers) {
+						try {
+							await handler(frozenEvent, ctx);
+						} catch (error) {
+							this.reportExecutionObserverError(ext.path, error);
+						}
+					}
+				}
+			});
+		} catch (error) {
+			this.reportExecutionObserverError("<execution>", error);
+		}
+	}
+
+	/** Run final deny-only guards. Throws on a block, hook failure, invalid result, or recursive execution. */
+	async guardExecution(execution: ExecutionRequest, signal?: AbortSignal, executionId?: string): Promise<void> {
+		// Reject before dispatching notifications, so observer-triggered execution cannot recursively notify itself.
+		if (executionObserverContext.getStore()) {
+			throw new Error("Recursive execution from an execution observer is not allowed; do not call pi.exec().");
+		}
+		const observed = this.hasHandlers("execution");
+		const id = observed ? (executionId ?? (execution.kind === "tool" ? execution.toolCallId : randomUUID())) : "";
+		let snapshot: ExecutionRequest | undefined;
+		let outcome: ExecutionEvent["outcome"] = "failed";
+		try {
+			this.assertActive();
+			this.runtime.assertActive();
+			if (!this.executionGuardBound) {
+				throw new Error("Extension execution guard not initialized. Call runner.bindCore() before execution.");
+			}
+			if (executionGuardContext.getStore()) {
+				throw new Error(
+					"Recursive execution from an execution_guard handler is not allowed; do not call pi.exec().",
+				);
+			}
+			signal?.throwIfAborted();
+			if (this.hasHandlers("execution_guard")) {
+				try {
+					snapshot = freezeExecutionSnapshot(structuredClone(execution));
+				} catch (error) {
+					throw new Error(
+						`execution_guard snapshot failed: ${error instanceof Error ? error.message : String(error)}`,
+						{
+							cause: error,
+						},
+					);
+				}
+				// Keep the original signal live; only the detached request and envelope are frozen.
+				const event: ExecutionGuardEvent = Object.freeze({ type: "execution_guard", execution: snapshot, signal });
+				const ctx = this.createContext();
+				await executionGuardContext.run(true, async () => {
+					for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "execution_guard")) {
+						for (const handler of handlers) {
+							this.assertActive();
+							this.runtime.assertActive();
+							signal?.throwIfAborted();
+							let result: ExecutionGuardEventResult | undefined;
+							try {
+								result = parseExecutionGuardResult(await handler(event, ctx));
+							} catch (error) {
+								const failure = new Error(
+									`execution_guard handler from "${ext.path}" failed: ${error instanceof Error ? error.message : String(error)}`,
+									{ cause: error },
+								);
+								this.emitError({
+									extensionPath: ext.path,
+									event: "execution_guard",
+									error: failure.message,
+									stack: failure.stack,
+								});
+								throw failure;
+							}
+							if (result?.block) {
+								outcome = "blocked";
+								throw new Error(
+									`Execution blocked by execution_guard from "${ext.path}": ${result.reason ?? "Blocked by extension"}`,
+								);
+							}
+						}
+					}
+				});
+			}
+			this.assertActive();
+			this.runtime.assertActive();
+			signal?.throwIfAborted();
+		} catch (error) {
+			if (observed) {
+				snapshot ??= this.snapshotObservedExecution(execution);
+				if (snapshot) {
+					await this.notifyExecution({
+						type: "execution",
+						executionId: id,
+						phase: "policy",
+						execution: snapshot,
+						timestamp: Date.now(),
+						outcome: signal?.aborted ? "cancelled" : outcome,
+						error: executionErrorMessage(error),
+					});
+				}
+			}
+			throw error;
+		}
+		if (observed) {
+			snapshot ??= this.snapshotObservedExecution(execution);
+			if (snapshot) {
+				await this.notifyExecution({
+					type: "execution",
+					executionId: id,
+					phase: "policy",
+					execution: snapshot,
+					timestamp: Date.now(),
+					outcome: "allowed",
+				});
+			}
+		}
+	}
+
+	/** Observe the actual operation, preserving its original result or thrown error. This does not run guards. */
+	async observeExecution<T>(
+		execution: ExecutionRequest,
+		operation: () => Promise<T>,
+		signal?: AbortSignal,
+		executionId?: string,
+	): Promise<T> {
+		if (executionObserverContext.getStore()) {
+			throw new Error("Recursive execution from an execution observer is not allowed; do not call pi.exec().");
+		}
+		signal?.throwIfAborted();
+		if (!this.hasHandlers("execution")) return operation();
+		const snapshot = this.snapshotObservedExecution(execution);
+		if (!snapshot) return operation();
+		const id = executionId ?? (execution.kind === "tool" ? execution.toolCallId : randomUUID());
+		// Snapshot work must not open an admission window for an already-cancelled operation.
+		signal?.throwIfAborted();
+		const startedAt = Date.now();
+		await this.notifyExecution({
+			type: "execution",
+			executionId: id,
+			phase: "start",
+			execution: snapshot,
+			timestamp: startedAt,
+		});
+		let result: T;
+		try {
+			result = await operation();
+		} catch (error) {
+			await this.notifyExecution({
+				type: "execution",
+				executionId: id,
+				phase: "end",
+				execution: snapshot,
+				timestamp: Date.now(),
+				durationMs: Date.now() - startedAt,
+				outcome: signal?.aborted ? "cancelled" : "failed",
+				error: executionErrorMessage(error),
+			});
+			throw error;
+		}
+		let resultSnapshot: unknown;
+		let outcome: ExecutionEvent["outcome"] = "succeeded";
+		try {
+			if (typeof result === "object" && result !== null) {
+				if (
+					("cancelled" in result && result.cancelled === true) ||
+					("killed" in result && result.killed === true)
+				) {
+					outcome = "cancelled";
+				} else if (
+					("isError" in result && result.isError === true) ||
+					("code" in result && typeof result.code === "number" && result.code !== 0) ||
+					("exitCode" in result && result.exitCode !== 0)
+				) {
+					outcome = "failed";
+				}
+			}
+			resultSnapshot = freezeExecutionSnapshot(structuredClone(result));
+		} catch (error) {
+			this.reportExecutionObserverError("<execution>", error);
+		}
+		await this.notifyExecution({
+			type: "execution",
+			executionId: id,
+			phase: "end",
+			execution: snapshot,
+			timestamp: Date.now(),
+			durationMs: Date.now() - startedAt,
+			outcome,
+			result: resultSnapshot,
+		});
+		return result;
 	}
 
 	async emitToolCall(event: ToolCallEvent): Promise<ToolCallEventResult | undefined> {

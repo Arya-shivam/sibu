@@ -70,6 +70,10 @@ export type {
 	EntryRenderOptions,
 	ExecOptions,
 	ExecResult,
+	ExecutionEvent,
+	ExecutionGuardEvent,
+	ExecutionGuardEventResult,
+	ExecutionRequest,
 	Extension,
 	ExtensionActions,
 	// API

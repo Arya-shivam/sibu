@@ -3,6 +3,7 @@
  *
  */
 
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import { createRequire } from "node:module";
 import * as path from "node:path";
@@ -18,6 +19,7 @@ import { execCommand } from "../exec.ts";
 import { readPiManifest } from "../pi-manifest.ts";
 import { createSyntheticSourceInfo } from "../source-info.ts";
 import { time } from "../timings.ts";
+import { type CleanupFailure, createExtensionCleanup, disposeExtensionCleanups } from "./cleanup.ts";
 import type {
 	EntryRenderer,
 	Extension,
@@ -182,11 +184,22 @@ export function createExtensionRuntime(): ExtensionRuntime {
 		pendingProviderRegistrations: [],
 		pendingNativeProviderRegistrations: [],
 		assertActive,
+		guardExecution: async () => {
+			throw new Error(
+				"Extension execution guard not initialized. pi.exec() cannot be called during extension loading or before runner.bindCore().",
+			);
+		},
+		observeExecution: async () => {
+			throw new Error(
+				"Extension execution observer not initialized. pi.exec() cannot be called during extension loading or before runner.bindCore().",
+			);
+		},
 		invalidate: (message) => {
 			if (state.staleMessage) return;
 			state.staleMessage =
 				message ??
 				"This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().";
+			void disposeExtensionCleanups(runtime);
 			for (const unsubscribe of eventBusUnsubscribers) unsubscribe();
 			eventBusUnsubscribers.clear();
 		},
@@ -230,11 +243,13 @@ function createExtensionAPI(
 	runtime: ExtensionRuntime,
 	cwd: string,
 	eventBus: EventBus,
-): { api: ExtensionAPI; commit: () => void; discard: () => void } {
+): { api: ExtensionAPI; commit: () => void; discard: () => Promise<CleanupFailure[]> } {
+	const cleanup = createExtensionCleanup(runtime, extension.path);
 	const pendingFlagValues = new Map<string, boolean | string>();
 	const pendingRuntimeChanges: Array<() => void> = [];
 	const loadingUnsubscribers: Array<() => void> = [];
 	let state: "loading" | "active" | "failed" = "loading";
+	let discardPromise: Promise<CleanupFailure[]> | undefined;
 	const assertActive = () => {
 		if (state === "failed") {
 			throw new Error(`Extension "${extension.path}" failed to load and its API is no longer active.`);
@@ -268,6 +283,11 @@ function createExtensionAPI(
 				handlers.splice(handlerIndex, 1);
 				if (handlers.length === 0) extension.handlers.delete(event);
 			};
+		},
+
+		registerCleanup(callback: () => void | Promise<void>): () => Promise<void> {
+			assertActive();
+			return cleanup.register(callback);
 		},
 
 		registerTool(tool: ToolDefinition): void {
@@ -378,9 +398,36 @@ function createExtensionAPI(
 			runtime.setLabel(entryId, label);
 		},
 
-		exec(command: string, args: string[], options?: ExecOptions) {
+		async exec(command: string, args: string[], options?: ExecOptions) {
 			assertActive();
-			return execCommand(command, args, options?.cwd ?? cwd, options);
+			if (state === "loading") {
+				throw new Error(`pi.exec() cannot be called while extension "${extension.path}" is loading.`);
+			}
+			const argsSnapshot = args.slice();
+			Object.freeze(argsSnapshot);
+			const execution = Object.freeze({
+				kind: "exec" as const,
+				command,
+				args: argsSnapshot,
+				cwd: options?.cwd ?? cwd,
+				extensionPath: extension.path,
+				timeout: options?.timeout,
+			});
+			const signal = options?.signal;
+			const executionId = randomUUID();
+			await runtime.guardExecution(execution, signal, executionId);
+			assertActive();
+			return runtime.observeExecution(
+				execution,
+				() =>
+					execCommand(execution.command, execution.args, execution.cwd, {
+						signal,
+						timeout: execution.timeout,
+						cwd: execution.cwd,
+					}),
+				signal,
+				executionId,
+			);
 		},
 
 		getActiveTools(): string[] {
@@ -460,10 +507,23 @@ function createExtensionAPI(
 			clearPending();
 		},
 		discard: () => {
-			if (state !== "loading") return;
+			if (discardPromise) return discardPromise;
+			if (state !== "loading") return Promise.resolve([]);
 			state = "failed";
-			for (const unsubscribe of loadingUnsubscribers) unsubscribe();
-			clearPending();
+			discardPromise = (async () => {
+				const failures: CleanupFailure[] = [];
+				for (let index = loadingUnsubscribers.length - 1; index >= 0; index--) {
+					try {
+						await loadingUnsubscribers[index]();
+					} catch (error) {
+						failures.push({ extensionPath: extension.path, error });
+					}
+				}
+				clearPending();
+				failures.push(...(await cleanup.dispose()));
+				return failures;
+			})();
+			return discardPromise;
 		},
 	};
 }
@@ -547,7 +607,24 @@ async function initializeExtension(
 		await factory(load.api);
 		load.commit();
 	} catch (error) {
-		load.discard();
+		const failures = await load.discard();
+		if (failures.length > 0) {
+			const cleanupErrors = failures.map(
+				(failure) =>
+					new Error(
+						`Cleanup failed for extension "${failure.extensionPath}": ${failure.error instanceof Error ? failure.error.message : String(failure.error)}`,
+						{ cause: failure.error },
+					),
+			);
+			throw new AggregateError(
+				[error, ...cleanupErrors],
+				[
+					error instanceof Error ? error.message : String(error),
+					...cleanupErrors.map((failure) => failure.message),
+				].join("\n"),
+				{ cause: error },
+			);
+		}
 		throw error;
 	}
 	time(`${extensionPath} factory`, "extensions");

@@ -13,6 +13,7 @@
  * Modes use this class and add their own I/O layer on top.
  */
 
+import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { basename, dirname } from "node:path";
 import type {
@@ -549,6 +550,21 @@ export class AgentSession {
 				}
 				throw new Error(`Extension failed, blocking execution: ${String(err)}`);
 			}
+		};
+
+		this.agent.beforeToolExecute = async ({ toolCall, args }, signal) => {
+			await this._extensionRunner.guardExecution(
+				{
+					kind: "tool",
+					toolName: toolCall.name,
+					toolCallId: toolCall.id,
+					input: args as Record<string, unknown>,
+					cwd: this.sessionManager.getCwd(),
+				},
+				signal,
+				toolCall.id,
+			);
+			return undefined;
 		};
 
 		this.agent.afterToolCall = async ({ toolCall, args, result, isError }) => {
@@ -3467,19 +3483,32 @@ export class AgentSession {
 		const prefix = this.settingsManager.getShellCommandPrefix();
 		const shellPath = this.settingsManager.getShellPath();
 		const resolvedCommand = prefix ? `${prefix}\n${command}` : command;
+		const executionId = randomUUID();
+		const execution = Object.freeze({
+			kind: "user_bash" as const,
+			command: resolvedCommand,
+			cwd: this.sessionManager.getCwd(),
+		});
 
 		try {
-			const result = await executeBashWithOperations(
-				resolvedCommand,
-				this.sessionManager.getCwd(),
-				options?.operations ?? createLocalBashOperations({ shellPath }),
-				{
-					onChunk: (delta) => {
-						onChunk?.(delta);
-						this._emit({ type: "bash_execution_update", id: options?.id, delta });
-					},
-					signal: abortController.signal,
-				},
+			await this._extensionRunner.guardExecution(execution, abortController.signal, executionId);
+			const result = await this._extensionRunner.observeExecution(
+				execution,
+				() =>
+					executeBashWithOperations(
+						execution.command,
+						execution.cwd,
+						options?.operations ?? createLocalBashOperations({ shellPath }),
+						{
+							onChunk: (delta) => {
+								onChunk?.(delta);
+								this._emit({ type: "bash_execution_update", id: options?.id, delta });
+							},
+							signal: abortController.signal,
+						},
+					),
+				abortController.signal,
+				executionId,
 			);
 
 			this.recordBashResult(command, result, options);

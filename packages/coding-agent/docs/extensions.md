@@ -57,7 +57,7 @@ The factory can be synchronous or asynchronous. Pi waits for an asynchronous fac
 
 Do not start processes, sockets, watchers, or timers in the factory because some invocations load extensions without starting a session.
 Start long-lived resources from `session_start` or from the command or tool that needs them.
-Close session-scoped resources from an idempotent `session_shutdown` handler.
+Register resource disposal with `pi.registerCleanup()`; use `session_shutdown` for shutdown notifications or work that must happen before disposal.
 
 A run proceeds from input and `before_agent_start`, through model, message, and tool events, to `agent_end`.
 Automatic retries, recovery, compaction, or queued work can continue afterward.
@@ -82,6 +82,7 @@ Automatic retries, recovery, compaction, or queued work can continue afterward.
 | Add a model provider | `pi.registerProvider()` |
 | Add terminal rendering | Renderer registration and `ctx.ui` |
 | Communicate with another extension | `pi.events` |
+| Own resource disposal across reload/failure/shutdown | `pi.registerCleanup()` |
 
 Use the exported declarations in [`extensions/types.ts`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/extensions/types.ts) for exact event, context, tool, and result types.
 
@@ -101,6 +102,24 @@ Events cover resource discovery, sessions, agent and message lifecycle, provider
 `before_agent_start` exposes both the current prompt and its structured `systemPromptOptions`. Prefer changing prompt sections, selected tools, or guidelines so Pi can append a transcript delta. Returning `systemPrompt`, or setting `forceSystemPrompt`, replaces the whole prompt for that run while the transcript continues recording the structured sections. Providers receive the forced text as their leading system prompt.
 
 `message_end` can replace a finalized message while preserving its role. `tool_call` can mutate input or block execution. `tool_result` handlers compose, with each handler seeing prior changes.
+
+### Final execution policy
+
+`execution_guard` is a deny-only boundary after `tool_call` rewrites and fresh schema validation. It also guards `pi.exec()` and `AgentSession.executeBash()`, including custom Bash backends. Handlers inspect a deeply frozen snapshot, return `undefined` or `{ block: false }` to abstain, or `{ block: true, reason }` to deny. A later handler cannot override a denial. Exceptions and malformed decisions fail closed.
+
+```typescript
+pi.on("execution_guard", ({ execution }) => {
+  if (execution.kind !== "tool" || ["bash", "powershell"].includes(execution.toolName)) {
+    return { block: true, reason: "Process execution disabled for this session" };
+  }
+});
+```
+
+The request kinds are `tool` (tool name, call ID, final input, cwd), `exec` (executable, argv, cwd, extension path, optional timeout), and `user_bash` (actual prefixed shell command and cwd). Use `event.signal` for the operation's cancellation signal; idle commands may not have one. Input cannot be rewritten from a guard. Tool denials become error tool results; command denials reject their calling API. Allowed executions preserve their existing results and transcript behavior; this event does not introduce a separate execution log.
+
+`pi.exec()` snapshots argv/options before awaiting policy and executes that snapshot. It is unavailable during extension factories and before the runner binds; move startup commands to `session_start`. Calling `pi.exec()` from a guard, including asynchronously inherited guard work, is rejected to prevent recursive policy execution.
+
+This is not a sandbox. It covers model-dispatched built-in/custom tools and the supported command APIs, not arbitrary `child_process` calls, direct calls to tool implementations, or commands an extension executes itself inside `user_bash` handlers. A worker's launch tool is guarded, but separate worker processes need their own policy configuration. Trusted extensions can still change Pi's behavior or run native code.
 
 <a id="provider_stream_event"></a>
 
@@ -206,8 +225,20 @@ Keep tool and event behavior independent from rendering so non-interactive modes
 
 Pi reports handler errors and continues where possible. A `tool_call` handler failure blocks the tool as a fail-safe; a tool execution failure becomes an error result for the model.
 
-Release resources in `session_shutdown` even when normal operation attempted cleanup.
-Keep cleanup idempotent because cancellation, reload, session replacement, and process exit can converge on the same path.
+`pi.registerCleanup(callback)` associates a synchronous or asynchronous disposer with the current extension. Register it when acquiring the resource. Its returned `() => Promise<void>` disposes immediately if needed; concurrent/repeated disposal awaits the same callback result without rerunning it.
+
+```typescript
+pi.on("session_start", () => {
+  const timer = setInterval(() => refreshStatus(), 1000);
+  pi.registerCleanup(() => clearInterval(timer));
+});
+```
+
+Cleanup runs sequentially in reverse registration order within an extension; extension scopes also drain in reverse creation order. Async shutdown and reload await it after `session_shutdown` handlers and before replacement startup, even when there are no shutdown handlers. The first shutdown event runs once per runner. Factory failure awaits disposal of that extension alone; successful siblings remain active. Cleanup failures are reported with extension provenance and do not skip other resources. Factory errors preserve the original failure and include any cleanup failures.
+
+Plain `session.dispose()` and runtime invalidation are synchronous and only initiate disposal. SDK callers that need completion can await `session.extensionRunner.dispose()` afterward; the async session-runtime disposal path already waits. Forced process termination cannot guarantee cleanup. A callback that never settles will delay an awaited teardown; give external services their own shutdown deadlines.
+
+Late cleanup registrations are rejected once teardown begins. Cleanup must use captured resource handles rather than stale Pi APIs. Do not await a scope-wide shutdown/disposal from inside its own callback; this reentry is rejected rather than deadlocking. Keep dependent teardown in one callback when it needs custom ordering.
 Use `ctx.shutdown()` to request an orderly process shutdown.
 
 <a id="examples-reference"></a>

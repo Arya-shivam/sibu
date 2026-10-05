@@ -37,6 +37,7 @@ export async function execCommand(
 	cwd: string,
 	options?: ExecOptions,
 ): Promise<ExecResult> {
+	options?.signal?.throwIfAborted();
 	return new Promise((resolve) => {
 		const proc = spawn(command, args, {
 			cwd,

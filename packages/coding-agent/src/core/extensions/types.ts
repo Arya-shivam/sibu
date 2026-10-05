@@ -982,6 +982,64 @@ export type InputEventResult =
 	| { action: "handled" };
 
 // ============================================================================
+// Final Execution Guard
+// ============================================================================
+
+/** Final execution details. Guard handlers receive a detached, deeply frozen snapshot. */
+export type ExecutionRequest =
+	| {
+			readonly kind: "tool";
+			readonly toolName: string;
+			readonly toolCallId: string;
+			readonly input: Readonly<Record<string, unknown>>;
+			readonly cwd: string;
+	  }
+	| {
+			readonly kind: "exec";
+			readonly command: string;
+			readonly args: readonly string[];
+			readonly cwd: string;
+			readonly extensionPath: string;
+			readonly timeout?: number;
+	  }
+	| {
+			readonly kind: "user_bash";
+			readonly command: string;
+			readonly cwd: string;
+	  };
+
+/** Deny-only hook immediately before execution. Neither execution details nor the event can be rewritten. */
+export interface ExecutionGuardEvent {
+	readonly type: "execution_guard";
+	readonly execution: ExecutionRequest;
+	/** The original execution signal, not cloned or frozen. */
+	readonly signal?: AbortSignal;
+}
+
+/** Returning undefined, {}, or block: false allows later guards to decide. The first block wins. */
+export interface ExecutionGuardEventResult {
+	block?: boolean;
+	reason?: string;
+}
+
+/**
+ * Observational execution lifecycle notification. Requests and results are detached, deeply frozen snapshots.
+ * Tool results describe the raw execute() result, before tool_result handlers transform it.
+ * Handler failures and return values cannot change execution; pi.exec() is forbidden inside these handlers.
+ */
+export interface ExecutionEvent {
+	readonly type: "execution";
+	readonly executionId: string;
+	readonly phase: "policy" | "start" | "end";
+	readonly execution: ExecutionRequest;
+	readonly timestamp: number;
+	readonly outcome?: "allowed" | "blocked" | "failed" | "cancelled" | "succeeded";
+	readonly durationMs?: number;
+	readonly error?: string;
+	readonly result?: unknown;
+}
+
+// ============================================================================
 // Tool Events
 // ============================================================================
 
@@ -1212,6 +1270,8 @@ export type ExtensionEvent =
 	| ThinkingLevelSelectEvent
 	| UserBashEvent
 	| InputEvent
+	| ExecutionGuardEvent
+	| ExecutionEvent
 	| ToolCallEvent
 	| ToolResultEvent;
 
@@ -1363,6 +1423,13 @@ export type ExtensionHandler<E, R = undefined> = (event: E, ctx: ExtensionContex
  * ExtensionAPI passed to extension factory functions.
  */
 export interface ExtensionAPI {
+	/**
+	 * Register cleanup when acquiring a resource. Called once during failed initialization,
+	 * reload, session replacement, or shutdown, in reverse registration order.
+	 * The returned disposer runs cleanup immediately and shares its result with later calls.
+	 */
+	registerCleanup(cleanup: () => void | Promise<void>): () => Promise<void>;
+
 	// =========================================================================
 	// Event Subscription
 	// =========================================================================
@@ -1431,6 +1498,8 @@ export interface ExtensionAPI {
 	on(event: "model_select", handler: ExtensionHandler<ModelSelectEvent>): () => void;
 	on(event: "thinking_level_select", handler: ExtensionHandler<ThinkingLevelSelectEvent>): () => void;
 	on(event: "tool_call", handler: ExtensionHandler<ToolCallEvent, ToolCallEventResult>): () => void;
+	on(event: "execution_guard", handler: ExtensionHandler<ExecutionGuardEvent, ExecutionGuardEventResult>): () => void;
+	on(event: "execution", handler: ExtensionHandler<ExecutionEvent>): () => void;
 	on(event: "tool_result", handler: ExtensionHandler<ToolResultEvent, ToolResultEventResult>): () => void;
 	on(event: "user_bash", handler: ExtensionHandler<UserBashEvent, UserBashEventResult>): () => void;
 	on(event: "input", handler: ExtensionHandler<InputEvent, InputEventResult>): () => void;
@@ -1528,7 +1597,7 @@ export interface ExtensionAPI {
 	/** Set or clear a label on an entry. Labels are user-defined markers for bookmarking/navigation. */
 	setLabel(entryId: string, label: string | undefined): void;
 
-	/** Execute a shell command. */
+	/** Execute a command after final execution guards. Unavailable during loading or before runner.bindCore(). */
 	exec(command: string, args: string[], options?: ExecOptions): Promise<ExecResult>;
 
 	/** Get the list of currently active tool names. */
@@ -1848,6 +1917,15 @@ export interface ExtensionRuntimeState {
 	pendingNativeProviderRegistrations: Array<{ provider: Provider; extensionPath: string }>;
 	/** Throws when this extension instance is stale after runtime replacement. */
 	assertActive: () => void;
+	/** Final deny-only check. Unavailable until runner.bindCore(); rejects on denial, hook failure, or invalid result. */
+	guardExecution: (execution: ExecutionRequest, signal?: AbortSignal, executionId?: string) => Promise<void>;
+	/** Observe an admitted operation without changing its result or error. Unavailable until runner.bindCore(). */
+	observeExecution: <T>(
+		execution: ExecutionRequest,
+		operation: () => Promise<T>,
+		signal?: AbortSignal,
+		executionId?: string,
+	) => Promise<T>;
 	/** Marks this extension instance as stale after runtime replacement or reload. */
 	invalidate: (message?: string) => void;
 	/** Retain an event-bus subscription until this runtime is invalidated. */
@@ -1865,7 +1943,7 @@ export interface ExtensionRuntimeState {
 
 /**
  * Action implementations for pi.* API methods.
- * Provided to runner.initialize(), copied into the shared runtime.
+ * Provided to runner.bindCore(), copied into the shared runtime.
  */
 export interface ExtensionActions {
 	sendMessage: SendMessageHandler;
@@ -1931,7 +2009,7 @@ export interface ExtensionCommandContextActions {
 
 /**
  * Full runtime = state + actions.
- * Created by loader with throwing action stubs, completed by runner.initialize().
+ * Created by loader with throwing action and execution-guard stubs, completed by runner.bindCore().
  */
 export interface ExtensionRuntime extends ExtensionRuntimeState, ExtensionActions {}
 
@@ -1956,7 +2034,7 @@ export interface LoadExtensionsResult {
 	extensions: Extension[];
 	errors: Array<{ path: string; error: string }>;
 	warnings?: Array<{ path: string; warning: string }>;
-	/** Shared runtime - actions are throwing stubs until runner.initialize() */
+	/** Shared runtime - actions and execution guards are throwing stubs until runner.bindCore(). */
 	runtime: ExtensionRuntime;
 }
 
