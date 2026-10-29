@@ -31,26 +31,18 @@ subagent/
 
 ## Installation
 
-From the repository root, symlink the files:
+Install the entry point from a trusted checkout. Its sibling modules must remain alongside it:
 
 ```bash
-# Symlink the extension (must be in a subdirectory with index.ts)
-mkdir -p ~/.pi/agent/extensions/subagent
-ln -sf "$(pwd)/packages/coding-agent/examples/extensions/subagent/index.ts" ~/.pi/agent/extensions/subagent/index.ts
-ln -sf "$(pwd)/packages/coding-agent/examples/extensions/subagent/agents.ts" ~/.pi/agent/extensions/subagent/agents.ts
-
-# Symlink agents
-mkdir -p ~/.pi/agent/agents
-for f in packages/coding-agent/examples/extensions/subagent/agents/*.md; do
-  ln -sf "$(pwd)/$f" ~/.pi/agent/agents/$(basename "$f")
-done
-
-# Symlink workflow prompts
-mkdir -p ~/.pi/agent/prompts
-for f in packages/coding-agent/examples/extensions/subagent/prompts/*.md; do
-  ln -sf "$(pwd)/$f" ~/.pi/agent/prompts/$(basename "$f")
-done
+pi install /absolute/path/to/pi/packages/coding-agent/examples/extensions/subagent/index.ts
 ```
+
+Put your agent definitions in `~/.pi/agent/agents/`. The bundled `agents/` and
+`prompts/` directories contain optional examples; inspect their model settings before
+installing them. An agent without a `model` field inherits the parent model and thinking level.
+
+Without sandbox configuration, this example runs local subprocesses. Separate
+conversation contexts are **not** a security sandbox.
 
 ## Security Model
 
@@ -63,6 +55,148 @@ This tool executes a separate `pi` subprocess with a delegated system prompt and
 To enable project-local agents, pass `agentScope: "both"` (or `"project"`). Only do this for repositories you trust.
 
 When running interactively, the tool prompts for confirmation before running project-local agents in untrusted projects. Trusted projects skip the additional prompt. Set `confirmProjectAgents: false` to disable confirmation.
+
+## Isolated execution with Docker Sandboxes
+
+Configure a local [`sbx`](https://docs.docker.com/ai/sandboxes/) installation and
+sign in first. This extension uses **local microVMs**, not Docker Agent as a second
+coordinator and not Docker MCP Gateway as an isolation boundary.
+
+Prepare a mountless shell sandbox containing a pinned Pi runtime, then save it as
+a template:
+
+```bash
+sbx create --name pi-runtime --cpus 2 --memory 2g --skills off shell
+sbx policy allow network --sandbox pi-runtime registry.npmjs.org:443
+sbx exec pi-runtime npm install --prefix /home/agent/pi-runtime --ignore-scripts --omit=dev --save-exact @earendil-works/pi-coding-agent@1.4.0
+sbx policy rm network --sandbox pi-runtime --resource registry.npmjs.org:443 --force
+sbx stop pi-runtime
+sbx template save pi-runtime pi-delegation:1.4.0
+```
+
+Use a deny-by-default base network policy. On a fresh installation,
+`sbx policy init deny-all` initializes it; review existing policy before changing
+this global setting. The extension adds and removes only sandbox-scoped provider
+allowances. Its `networkAllow` configuration does not replace a broader global policy.
+
+Create trusted user configuration at `~/.pi/agent/subagent-sandbox.json`, or pass
+`--subagent-sandbox-config /path/to/config.json`:
+
+```json
+{
+  "executable": "/absolute/path/to/sbx",
+  "template": "pi-delegation:1.4.0",
+  "piCommand": "/home/agent/pi-runtime/node_modules/.bin/pi",
+  "cpus": 2,
+  "memory": "2g",
+  "timeoutMs": 600000,
+  "networkAllow": ["chatgpt.com:443", "api.openai.com:443"],
+  "egmRoot": "/absolute/path/to/elephant-goldfish-model",
+  "codexProxy": {
+    "command": "/absolute/path/to/node /private/path/to/pi/cli.js auth print-bearer-token --provider openai-codex",
+    "accountId": "your-codex-account-id"
+  }
+}
+```
+
+`executable` is a host path; `piCommand` is a Linux path inside the saved template.
+On Windows use the installed `sbx.exe` path for `executable`. Configuration selects
+the backend; tool arguments cannot downgrade it to host execution. Invalid
+configuration fails closed. After sandbox mode is selected, a disappearing default
+configuration is also an error until the extension reloads.
+
+### Credentials and capability boundaries
+
+The parent model is inherited unless an agent specifies a model. For Codex OAuth,
+`codexProxy.command` must resolve the current access token on the **host** using
+private absolute paths. The command and everything it loads must be outside any
+writable worker mount. Set `accountId` to the signed-in account's
+`https://api.openai.com/auth.chatgpt_account_id` JWT claim without exposing the
+access token in logs or configuration.
+
+The extension registers a sandbox-scoped dynamic secret and supplies Pi only a
+synthetic, non-secret OAuth token carrying that account identifier. The sbx proxy
+replaces the outbound Authorization header with the real token on the host.
+An API key placeholder alone does not authenticate the OAuth-only Codex provider.
+Other providers require their appropriate sbx proxy secrets and network rules;
+the extension never imports your entire environment or authentication store.
+
+Every dispatch creates a new sandbox and fresh Pi state. No parent transcript,
+host home, main checkout, or host Docker socket is mounted. Automatic extension,
+MCP, skill, prompt-template, theme, and context-file loading is disabled in the
+child. Parent extension guards are not copied: the sandbox, selected workspace,
+tool allowlist, and sbx policy are the child's boundaries.
+
+Reviewers receive `read,grep,find,ls` only. Their selected source snapshot is a
+read-only secondary mount; sbx's required writable primary mount is an empty
+disposable scratch directory. Workers receive only their own writable snapshot
+or worktree. The sandbox can have its own Docker daemon; it is not the host daemon.
+Templates are trusted executable environments and must not contain credentials
+or conversation history.
+
+Timeout, cancellation, reload, or shutdown stop/remove the guest and remove
+scoped credentials, network allowances, and temporary payloads. Cleanup failures
+are reported, not hidden. Worker outputs remain on the host for inspection.
+
+### EGM Goldfish reviewers
+
+Install the **whole** EGM repository as a Pi package, not isolated skill files:
+
+```bash
+pi install git:github.com/google/elephant-goldfish-model@403d8881d62022490637d740657b33f01e321ea8
+```
+
+Point `egmRoot` at its installed package directory. Personas are discovered directly
+from `agents/`; trusted EGM definitions take precedence over same-named user or
+project definitions. Only EGM `agents/` and `resources/` are copied into each guest.
+The parent receives the available reviewer names and direct-dispatch instructions.
+
+```json
+{
+  "agent": "egm-design",
+  "task": "Mode: REVIEW. TargetFile: docs/design.md. Review the delivery guarantees.",
+  "files": ["docs/design.md", "src/delivery.ts"]
+}
+```
+
+EGM agents cannot receive worker permissions. Reviewers require an explicit
+workspace-relative `files` list; `[]` allows a task-only brainstorm. Referenced
+source must be included explicitly. Snapshots contain current disk bytes,
+including selected uncommitted changes, but never `.git` metadata or symlinks.
+Limits: 10,000 files, 16 MiB per file, 100 MiB total.
+
+This backend does not nest delegation. Follow EGM's direct-dispatch fallback:
+the parent invokes leaf reviewers, synthesizes findings, and writes reports.
+Requests to run `egm-synthesizer` or `egm-bootstrap-orchestrator` as child agents
+are rejected with that guidance.
+
+### Optional implementation worktrees
+
+```json
+{
+  "agent": "worker",
+  "task": "Implement the scoped change and verify its behavior. Do not commit or merge.",
+  "workspace": "worktree"
+}
+```
+
+Each worktree gets a unique `pi-subagent/<uuid>` branch from **HEAD**. Original
+uncommitted changes are intentionally excluded; use the default snapshot mode
+when current dirty source is needed. Worktree mode does not accept `files`.
+No commit, merge, push, branch deletion, or removal of completed worker workspaces
+is performed automatically. Git administration stays on the host because the
+main repository's Git metadata is not mounted.
+
+Results include the retained workspace path and branch, including after worker
+failure. Review changes on the host with `git -C <workspace-path> diff`.
+Use `git worktree list` to find the worktree root before manually removing it.
+Workers using snapshot mode also retain their output directory.
+
+A delegated `cwd` must remain within the parent session workspace or a worker
+workspace created by this extension during the current runtime. To resume work in
+a retained external workspace after reload, start Pi in that workspace. Worktrees
+separate edits; the microVM supplies execution isolation.
+
 
 ## Usage
 

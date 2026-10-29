@@ -8,13 +8,15 @@ import { CONFIG_DIR_NAME, getAgentDir, parseFrontmatter } from "@earendil-works/
 
 export type AgentScope = "user" | "project" | "both";
 
+export type AgentSource = "user" | "project" | "egm";
+
 export interface AgentConfig {
 	name: string;
 	description: string;
 	tools?: string[];
 	model?: string;
 	systemPrompt: string;
-	source: "user" | "project";
+	source: AgentSource;
 	filePath: string;
 }
 
@@ -59,7 +61,7 @@ function parseToolList(value: unknown): string[] | undefined {
 	return tools.length > 0 ? tools : undefined;
 }
 
-function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig[] {
+function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
 	const agents: AgentConfig[] = [];
 
 	if (!fs.existsSync(dir)) {
@@ -125,7 +127,7 @@ function findNearestProjectAgentsDir(cwd: string): string | null {
 	}
 }
 
-export function discoverAgents(cwd: string, scope: AgentScope): AgentDiscoveryResult {
+export function discoverAgents(cwd: string, scope: AgentScope, egmRoot?: string): AgentDiscoveryResult {
 	const userDir = path.join(getAgentDir(), "agents");
 	const projectAgentsDir = findNearestProjectAgentsDir(cwd);
 
@@ -141,6 +143,12 @@ export function discoverAgents(cwd: string, scope: AgentScope): AgentDiscoveryRe
 		for (const agent of userAgents) agentMap.set(agent.name, agent);
 	} else {
 		for (const agent of projectAgents) agentMap.set(agent.name, agent);
+	}
+
+	if (egmRoot) {
+		for (const agent of loadAgentsFromDir(path.join(egmRoot, "agents"), "egm")) {
+			agentMap.set(agent.name, agent);
+		}
 	}
 
 	return { agents: Array.from(agentMap.values()), projectAgentsDir };

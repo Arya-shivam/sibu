@@ -41,7 +41,9 @@ cp permission-gate.ts ~/.pi/agent/extensions/
 | `minimal-mode.ts` | Override built-in tool rendering for minimal display (only tool calls, no output in collapsed mode) |
 | `truncated-tool.ts` | Wraps ripgrep with proper output truncation (50KB/2000 lines) |
 | `ssh.ts` | Delegate all tools to a remote machine via SSH using pluggable operations |
-| `subagent/` | Delegate tasks to specialized subagents with isolated context windows |
+| `subagent/` | Fresh-context delegation with optional sbx microVM isolation, EGM reviewers, and retained worker worktrees |
+| `code-intelligence/` | Managed stdio LSP navigation, fresh document diagnostics, and read-only rename previews; requires explicit trusted server configuration |
+| `context-engine/` | Hash-tracked source ranges, active-context reuse, stale-source warnings, and bounded LSP symbol maps over selected files |
 
 ### Commands & UI
 

@@ -28,7 +28,10 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
+import { type AgentConfig, type AgentScope, type AgentSource, discoverAgents } from "./agents.ts";
+import { runSandbox, type SandboxConfig } from "./sandbox.ts";
+import { loadSandboxConfig } from "./sandbox-config.ts";
+import { type PreparedWorkspace, prepareWorkspace, type WorkspaceMode, type WorkspaceRole } from "./workspace.ts";
 
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
@@ -148,7 +151,7 @@ interface UsageStats {
 
 interface SingleResult {
 	agent: string;
-	agentSource: "user" | "project" | "unknown";
+	agentSource: AgentSource | "unknown";
 	task: string;
 	exitCode: number;
 	messages: Message[];
@@ -158,6 +161,7 @@ interface SingleResult {
 	stopReason?: string;
 	errorMessage?: string;
 	step?: number;
+	workspace?: { path: string; mode: WorkspaceMode; retained: boolean; branch?: string; sandboxName?: string };
 }
 
 interface SubagentDetails {
@@ -165,6 +169,50 @@ interface SubagentDetails {
 	agentScope: AgentScope;
 	projectAgentsDir: string | null;
 	results: SingleResult[];
+}
+
+interface IsolatedTaskOptions {
+	role?: WorkspaceRole;
+	workspace?: WorkspaceMode;
+	files?: string[];
+}
+
+function recordAgentLine(line: string, result: SingleResult, emitUpdate: () => void): void {
+	let event: unknown;
+	try {
+		event = JSON.parse(line);
+	} catch {
+		return;
+	}
+	if (!event || typeof event !== "object" || !("type" in event) || !("message" in event)) return;
+	if (event.type !== "message_end" && event.type !== "tool_result_end") return;
+	const message = event.message;
+	if (!message || typeof message !== "object" || !("role" in message) || !("content" in message)) return;
+	if (!Array.isArray(message.content)) return;
+	if (message.role !== "assistant" && message.role !== "user" && message.role !== "toolResult") return;
+	const msg = message as Message;
+	result.messages.push(msg);
+	if (msg.role === "assistant") {
+		result.usage.turns++;
+		const usage = msg.usage;
+		if (usage) {
+			result.usage.input += usage.input || 0;
+			result.usage.output += usage.output || 0;
+			result.usage.cacheRead += usage.cacheRead || 0;
+			result.usage.cacheWrite += usage.cacheWrite || 0;
+			result.usage.cost += usage.cost?.total || 0;
+			result.usage.contextTokens = usage.totalTokens || 0;
+		}
+		if (!result.model && msg.model) result.model = msg.model;
+		if (msg.stopReason) result.stopReason = msg.stopReason;
+		if (msg.errorMessage) result.errorMessage = msg.errorMessage;
+	}
+	emitUpdate();
+}
+
+function resultWorkspace(result: SingleResult): string {
+	if (!result.workspace?.retained) return "";
+	return `\n\nWorkspace: ${result.workspace.path}${result.workspace.branch ? `\nBranch: ${result.workspace.branch} (based on HEAD; original uncommitted changes are not included)` : ""}`;
 }
 
 function getFinalOutput(messages: Message[]): string {
@@ -267,6 +315,8 @@ type OnUpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void;
 interface DispatchDefaults {
 	model?: string;
 	thinkingLevel?: ThinkingLevel;
+	sandbox?: SandboxConfig;
+	ownedWorkspaces: Set<string>;
 }
 
 async function runSingleAgent(
@@ -280,6 +330,7 @@ async function runSingleAgent(
 	signal: AbortSignal | undefined,
 	onUpdate: OnUpdateCallback | undefined,
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
+	isolation: IsolatedTaskOptions = {},
 ): Promise<SingleResult> {
 	const agent = agents.find((a) => a.name === agentName);
 
@@ -330,6 +381,89 @@ async function runSingleAgent(
 		}
 	};
 
+	if (dispatchDefaults.sandbox) {
+		let workspace: PreparedWorkspace | undefined;
+		try {
+			if (agent.source === "egm" && /orchestrator|synthesizer/.test(agent.name)) {
+				throw new Error(
+					"This backend does not nest subagents. Dispatch EGM leaf reviewers directly and synthesize their reports in the parent session.",
+				);
+			}
+			const role = isolation.role ?? (agent.source === "egm" ? "reviewer" : "worker");
+			if (agent.source === "egm" && role !== "reviewer")
+				throw new Error("EGM reviewers cannot run with worker permissions");
+			const root = await fs.promises.realpath(defaultCwd);
+			const sourceCwd = await fs.promises.realpath(path.resolve(defaultCwd, cwd ?? "."));
+			const allowedRoots = [root, ...dispatchDefaults.ownedWorkspaces];
+			if (
+				!allowedRoots.some((allowed) => {
+					const relative = path.relative(allowed, sourceCwd);
+					return (
+						relative === "" ||
+						(relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))
+					);
+				})
+			)
+				throw new Error(
+					"Subagent cwd must stay inside the session workspace or a worker workspace created by this extension",
+				);
+			workspace = await prepareWorkspace({
+				cwd: sourceCwd,
+				role,
+				mode: isolation.workspace ?? "snapshot",
+				files: isolation.files,
+				signal,
+			});
+			currentResult.workspace = {
+				path: workspace.path,
+				mode: workspace.mode,
+				retained: role === "worker",
+				branch: workspace.branch,
+			};
+			if (role === "worker") dispatchDefaults.ownedWorkspaces.add(workspace.path);
+			let buffer = "";
+			const sandbox = await runSandbox(dispatchDefaults.sandbox, {
+				workspace,
+				agentName: agent.name,
+				systemPrompt: agent.systemPrompt,
+				task,
+				sourceCwd,
+				model,
+				thinkingLevel: inheritsDispatchConfig ? dispatchDefaults.thinkingLevel : undefined,
+				tools:
+					role === "reviewer"
+						? ["read", "grep", "find", "ls"]
+						: (agent.tools ?? ["read", "grep", "find", "ls", "bash", "edit", "write"]),
+				signal,
+				onStdout(chunk) {
+					buffer += chunk;
+					const lines = buffer.split("\n");
+					buffer = lines.pop() ?? "";
+					for (const line of lines) recordAgentLine(line, currentResult, emitUpdate);
+				},
+			});
+			if (buffer.trim()) recordAgentLine(buffer, currentResult, emitUpdate);
+			currentResult.workspace.sandboxName = sandbox.sandboxName;
+			currentResult.exitCode = sandbox.exitCode;
+			currentResult.stderr = sandbox.stderr;
+			if (!currentResult.messages.some((message) => message.role === "assistant")) {
+				currentResult.exitCode = currentResult.exitCode || 1;
+				currentResult.errorMessage = sandbox.stderr || "Sandboxed Pi produced no assistant response";
+			}
+		} catch (error) {
+			currentResult.exitCode = 1;
+			currentResult.stopReason = signal?.aborted ? "aborted" : "error";
+			currentResult.errorMessage = error instanceof Error ? error.message : String(error);
+			currentResult.stderr = currentResult.errorMessage;
+		} finally {
+			await workspace?.cleanup();
+		}
+		return currentResult;
+	}
+	if (isolation.role || isolation.workspace || isolation.files) {
+		throw new Error("Isolated workspace options require a trusted subagent sandbox configuration");
+	}
+
 	try {
 		if (agent.systemPrompt.trim()) {
 			const tmp = await writePromptToTempFile(agent.name, agent.systemPrompt);
@@ -350,42 +484,7 @@ async function runSingleAgent(
 			});
 			let buffer = "";
 
-			const processLine = (line: string) => {
-				if (!line.trim()) return;
-				let event: any;
-				try {
-					event = JSON.parse(line);
-				} catch {
-					return;
-				}
-
-				if (event.type === "message_end" && event.message) {
-					const msg = event.message as Message;
-					currentResult.messages.push(msg);
-
-					if (msg.role === "assistant") {
-						currentResult.usage.turns++;
-						const usage = msg.usage;
-						if (usage) {
-							currentResult.usage.input += usage.input || 0;
-							currentResult.usage.output += usage.output || 0;
-							currentResult.usage.cacheRead += usage.cacheRead || 0;
-							currentResult.usage.cacheWrite += usage.cacheWrite || 0;
-							currentResult.usage.cost += usage.cost?.total || 0;
-							currentResult.usage.contextTokens = usage.totalTokens || 0;
-						}
-						if (!currentResult.model && msg.model) currentResult.model = msg.model;
-						if (msg.stopReason) currentResult.stopReason = msg.stopReason;
-						if (msg.errorMessage) currentResult.errorMessage = msg.errorMessage;
-					}
-					emitUpdate();
-				}
-
-				if (event.type === "tool_result_end" && event.message) {
-					currentResult.messages.push(event.message as Message);
-					emitUpdate();
-				}
-			};
+			const processLine = (line: string) => recordAgentLine(line, currentResult, emitUpdate);
 
 			proc.stdout.on("data", (data) => {
 				buffer += data.toString();
@@ -439,16 +538,39 @@ async function runSingleAgent(
 	}
 }
 
+const IsolationProperties = {
+	role: Type.Optional(
+		StringEnum(["reviewer", "worker"] as const, {
+			description: "Reviewer is read-only; worker can edit its own workspace. EGM personas are always reviewers.",
+		}),
+	),
+	workspace: Type.Optional(
+		StringEnum(["snapshot", "worktree"] as const, {
+			description:
+				"Default snapshot includes selected current files. Worker worktree is a new branch from HEAD, excluding original uncommitted changes.",
+		}),
+	),
+	files: Type.Optional(
+		Type.Array(Type.String(), {
+			description:
+				"Approved workspace-relative input files. Required for reviewers; [] permits a task-only brainstorm.",
+			maxItems: 10000,
+		}),
+	),
+};
+
 const TaskItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
 	task: Type.String({ description: "Task to delegate to the agent" }),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
+	...IsolationProperties,
 });
 
 const ChainItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
 	task: Type.String({ description: "Task with optional {previous} placeholder for prior output" }),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
+	...IsolationProperties,
 });
 
 const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
@@ -466,15 +588,46 @@ const SubagentParams = Type.Object({
 		Type.Boolean({ description: "Prompt before running project-local agents. Default: true.", default: true }),
 	),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process (single mode)" })),
+	...IsolationProperties,
 });
 
 export default function (pi: ExtensionAPI) {
+	const owner = new AbortController();
+	const activeRuns = new Set<Promise<SingleResult>>();
+	const ownedWorkspaces = new Set<string>();
+	let sandboxRequired = false;
+	const sandboxConfiguration = (): SandboxConfig | undefined => {
+		const config = loadSandboxConfig(pi.getFlag("subagent-sandbox-config"));
+		if (config) sandboxRequired = true;
+		else if (sandboxRequired) throw new Error("Sandbox configuration disappeared; refusing local execution");
+		return config;
+	};
+	pi.registerFlag("subagent-sandbox-config", {
+		type: "string",
+		description: "Trusted sbx configuration; defaults to ~/.pi/agent/subagent-sandbox.json when present",
+	});
+	pi.on("session_shutdown", async () => {
+		owner.abort(new Error("Subagent extension disposed"));
+		await Promise.allSettled(activeRuns);
+	});
+	pi.on("before_agent_start", (event, ctx) => {
+		const sandbox = sandboxConfiguration();
+		if (!sandbox) return;
+		const reviewers = discoverAgents(ctx.cwd, "user", sandbox.egmRoot)
+			.agents.filter((agent) => agent.source === "egm" && !/orchestrator|synthesizer/.test(agent.name))
+			.map((agent) => `${agent.name}: ${agent.description}`);
+		return {
+			systemPrompt: `${event.systemPrompt}\n\nSubagent execution uses sbx microVMs; it never falls back to host execution. Each call has fresh context, not this conversation. Pass only its task and approved relative files. EGM reviews require role=reviewer and files (use [] for task-only brainstorming). This backend has no nested delegation: dispatch EGM leaf reviewers directly with the subagent tool, then synthesize their reports and write artifacts in this parent session. Workers may request workspace=worktree; branches start at HEAD and exclude this checkout's uncommitted changes. Worker paths/branches are returned without committing or merging.\nAvailable EGM leaf reviewers:\n${reviewers.join("\n") || "(none configured)"}`,
+		};
+	});
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
 		description: [
 			"Delegate tasks to specialized subagents with isolated context.",
 			"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
+			"When trusted sandbox configuration is present, every task runs in sbx with no host fallback.",
+			"Reviewers require explicit files; use [] for task-only brainstorming. Worker worktrees start at HEAD.",
 			`Default agent scope is "user" (from ${path.join(getAgentDir(), "agents")}).`,
 			`To enable project-local agents in ${CONFIG_DIR_NAME}/agents, set agentScope: "both" (or "project").`,
 		].join(" "),
@@ -485,10 +638,38 @@ export default function (pi: ExtensionAPI) {
 			const dispatchDefaults: DispatchDefaults = {
 				model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
 				thinkingLevel: ctx.thinkingLevel,
+				sandbox: sandboxConfiguration(),
+				ownedWorkspaces,
 			};
-			const discovery = discoverAgents(ctx.cwd, agentScope);
+			const discovery = discoverAgents(ctx.cwd, agentScope, dispatchDefaults.sandbox?.egmRoot);
 			const agents = discovery.agents;
 			const confirmProjectAgents = params.confirmProjectAgents ?? true;
+			const executionSignal = signal ? AbortSignal.any([signal, owner.signal]) : owner.signal;
+			const dispatch = (
+				agentName: string,
+				task: string,
+				cwd: string | undefined,
+				step: number | undefined,
+				update: OnUpdateCallback | undefined,
+				details: (results: SingleResult[]) => SubagentDetails,
+				options: IsolatedTaskOptions,
+			): Promise<SingleResult> => {
+				const run = runSingleAgent(
+					ctx.cwd,
+					dispatchDefaults,
+					agents,
+					agentName,
+					task,
+					cwd,
+					step,
+					executionSignal,
+					update,
+					details,
+					options,
+				);
+				activeRuns.add(run);
+				return run.finally(() => activeRuns.delete(run));
+			};
 
 			const hasChain = (params.chain?.length ?? 0) > 0;
 			const hasTasks = (params.tasks?.length ?? 0) > 0;
@@ -570,17 +751,14 @@ export default function (pi: ExtensionAPI) {
 							}
 						: undefined;
 
-					const result = await runSingleAgent(
-						ctx.cwd,
-						dispatchDefaults,
-						agents,
+					const result = await dispatch(
 						step.agent,
 						taskWithContext,
 						step.cwd,
 						i + 1,
-						signal,
 						chainUpdate,
 						makeDetails("chain"),
+						step,
 					);
 					results.push(result);
 
@@ -588,7 +766,12 @@ export default function (pi: ExtensionAPI) {
 					if (isError) {
 						const errorMsg = getResultOutput(result);
 						return {
-							content: [{ type: "text", text: `Chain stopped at step ${i + 1} (${step.agent}): ${errorMsg}` }],
+							content: [
+								{
+									type: "text",
+									text: `Chain stopped at step ${i + 1} (${step.agent}): ${errorMsg}${resultWorkspace(result)}`,
+								},
+							],
 							details: makeDetails("chain")(results),
 							isError: true,
 						};
@@ -596,7 +779,14 @@ export default function (pi: ExtensionAPI) {
 					previousOutput = getFinalOutput(result.messages);
 				}
 				return {
-					content: [{ type: "text", text: getFinalOutput(results[results.length - 1].messages) || "(no output)" }],
+					content: [
+						{
+							type: "text",
+							text:
+								(getFinalOutput(results[results.length - 1].messages) || "(no output)") +
+								results.map(resultWorkspace).join(""),
+						},
+					],
 					details: makeDetails("chain")(results),
 				};
 			}
@@ -643,15 +833,11 @@ export default function (pi: ExtensionAPI) {
 				};
 
 				const results = await mapWithConcurrencyLimit(params.tasks, MAX_CONCURRENCY, async (t, index) => {
-					const result = await runSingleAgent(
-						ctx.cwd,
-						dispatchDefaults,
-						agents,
+					const result = await dispatch(
 						t.agent,
 						t.task,
 						t.cwd,
 						undefined,
-						signal,
 						// Per-task update callback
 						(partial) => {
 							if (partial.details?.results[0]) {
@@ -660,6 +846,7 @@ export default function (pi: ExtensionAPI) {
 							}
 						},
 						makeDetails("parallel"),
+						t,
 					);
 					allResults[index] = result;
 					emitParallelUpdate();
@@ -672,7 +859,7 @@ export default function (pi: ExtensionAPI) {
 					const status = isFailedResult(r)
 						? `failed${r.stopReason && r.stopReason !== "end" ? ` (${r.stopReason})` : ""}`
 						: "completed";
-					return `### [${r.agent}] ${status}\n\n${output}`;
+					return `### [${r.agent}] ${status}\n\n${output}${resultWorkspace(r)}`;
 				});
 				return {
 					content: [
@@ -686,29 +873,33 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (params.agent && params.task) {
-				const result = await runSingleAgent(
-					ctx.cwd,
-					dispatchDefaults,
-					agents,
+				const result = await dispatch(
 					params.agent,
 					params.task,
 					params.cwd,
 					undefined,
-					signal,
 					onUpdate,
 					makeDetails("single"),
+					params,
 				);
 				const isError = isFailedResult(result);
 				if (isError) {
 					const errorMsg = getResultOutput(result);
 					return {
-						content: [{ type: "text", text: `Agent ${result.stopReason || "failed"}: ${errorMsg}` }],
+						content: [
+							{
+								type: "text",
+								text: `Agent ${result.stopReason || "failed"}: ${errorMsg}${resultWorkspace(result)}`,
+							},
+						],
 						details: makeDetails("single")([result]),
 						isError: true,
 					};
 				}
 				return {
-					content: [{ type: "text", text: getFinalOutput(result.messages) || "(no output)" }],
+					content: [
+						{ type: "text", text: (getFinalOutput(result.messages) || "(no output)") + resultWorkspace(result) },
+					],
 					details: makeDetails("single")([result]),
 				};
 			}
