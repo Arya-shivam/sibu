@@ -321,7 +321,186 @@ warning was also observed. No successful full-repository check is claimed; those
 unrelated files were not changed for this work. The user explicitly approved
 committing with those failures documented, without bypassing Git hooks.
 
-## 10. Evaluation specification: is it fruitful?
+## 10. Problems encountered and their resolutions
+
+These notes distinguish actual installation/runtime failures, failure cases
+reproduced in regression tests, and deployment work that remains incomplete.
+They are not a claim that each problem occurred in production.
+
+### EGM installed in the wrong harness
+
+**Problem:** installing EGM through OMP did not make it available in Pi. Its name
+also suggested a downloadable model, but EGM is a skill/reviewer package using the
+host's existing model.
+
+**Resolution:** install the complete repository through Pi's package manager:
+
+```text
+pi install git:github.com/google/elephant-goldfish-model@403d8881d62022490637d740657b33f01e321ea8
+pi list
+```
+
+The complete bundle preserves `agents/` and `resources/document_standards/`.
+Pi runtime discovery verified all seven skill commands. Use `/skill:egm-review`,
+not OMP/Claude-specific plugin commands. Skills alone did not supply a subagent
+execution tool; the sandbox delegation extension supplies that capability.
+
+### Committed extensions versus the installed Pi runtime
+
+**Problem:** committing new core APIs did not upgrade the globally installed Pi.
+Its extension declarations lacked `registerCleanup`, although new examples use it.
+Installing those example files alone is not a complete runtime deployment.
+
+**Resolution:** distinguish three states: code committed, extension configured,
+and a compatible runtime actually executing it. `pi list` reports configured
+packages, not proof that every dependency/API is available. User-level
+`~/.pi/agent/settings.json` currently configures EGM and sandbox delegation;
+LSP, Context Engine, Recorder, and Verification remain opt-in.
+
+From the repository root, this source-checkout invocation was exercised:
+
+```text
+node --import ./packages/coding-agent/src/experimental/source-resolver.ts ./packages/coding-agent/src/cli.ts --offline --version
+```
+
+The repository's `pi-test.ps1` launcher uses the same resolver and source entry
+point. Use a compatible source/runtime when enabling core-dependent examples,
+with their documented `--extension` and configuration flags. A higher version
+number on a different installed distribution does not prove it contains this
+checkout's custom APIs.
+
+**Status:** the source version command and SDK feature paths were verified, and
+the installed Pi exposed the sandbox subagent tool. Replacing the everyday global
+Pi command and activating every optional extension has not been completed. Do not
+infer that deployment from the Git commits or from a successful `pi install`.
+
+### Docker Desktop did not provide a usable `docker sandbox` command
+
+**Problem:** `docker sandbox` reported that it had been removed. Docker Desktop
+being running did not mean the separate Sandboxes CLI was installed, authenticated,
+or serving its local daemon.
+
+**Resolution:** install and use `sbx`. The tested Windows installation used:
+
+```text
+winget install --id Docker.sbx --exact --version 0.50.1
+sbx diagnose
+```
+
+The attempted WinGet installation with explicit `--scope user` returned
+`No applicable installer found`; omitting that flag succeeded with the tested
+package. The executable was installed under
+`%LOCALAPPDATA%/DockerSandboxes/bin/sbx.exe`; use its absolute path if an existing
+terminal has not picked up PATH changes.
+
+Diagnosis confirmed virtualization support, then reported a missing daemon and
+separate sign-in requirement. Run `sbx daemon start` in a persistent terminal or
+supervised service, complete `sbx login` in the browser, and use another terminal
+for sandbox commands. A foreground daemon launched under a short command timeout
+will not remain a dependable backend.
+
+**Evidence:** the local daemon became healthy and actual local microVM creation
+succeeded. No cloud backend or automatic Windows virtualization changes were used.
+
+### Read-only primary workspace rejected by sbx
+
+**Problem:** reviewer creation failed with
+`primary workspace must be read/write (remove ':ro' or ':readonly')`.
+Declaring the sole workspace read-only was incompatible with the tested release.
+
+**Resolution:** make empty disposable scratch the writable primary and mount the
+selected review snapshot as a read-only secondary workspace. Resolve that
+secondary path through guest execution; do not silently review the empty scratch
+directory if path mapping fails. Windows host paths and guest paths differ.
+
+**Evidence:** actual mount inspection showed the selected source as read-only,
+and a write attempt returned `Read-only file system`. The live reviewer then read
+the selected document successfully. Regression tests cover secondary-path failure
+and removal of temporary primary scratch.
+
+### Guest payload ownership after `sbx cp`
+
+**Problem:** copied probe files were root-owned; deleting one as the normal guest
+agent failed with `Operation not permitted`. Restrictive copied payload permissions
+can also prevent the agent from reading its task and synthetic authentication file.
+
+**Resolution:** the coordinator repairs ownership inside the guest, then restricts
+payload permissions before launching Pi as `agent`. Setup-only root execution is
+inside the guest; it does not grant the model a host shell or mount the host home.
+Remove only the payloads/sandboxes owned by the dispatch, not unrelated resources.
+
+### OAuth-only Codex could not use an API-key placeholder as its login
+
+**Problem:** the shell template supplied `proxy-managed` provider variables.
+That is not a leaked real key, but `OPENAI_API_KEY` alone does not authenticate
+Pi's OAuth-only `openai-codex` provider. Pi also validates the token's account claim
+locally before issuing its request.
+
+**Resolution:** use an explicitly configured host-side token resolver and matching
+account identifier. Register it as a sandbox-scoped sbx secret, create only the
+non-secret synthetic guest OAuth record, and let the host proxy replace the
+outbound Authorization header. Do not copy the host auth file, print the access
+token, import all environment secrets, or downgrade to another provider silently.
+
+**Evidence:** the live EGM review and worker used the configured Codex model through
+this path. Post-run inspection found no remaining scoped secrets or provider
+allowances. Configure the resolver on each machine; it is intentionally absent
+from committed credentials and templates.
+
+### Truncated reports were incorrectly accepted as completed reviews
+
+**Problem:** a regression fixture ending with `stopReason: \"length\"` and
+`agent_end` resolved successfully even though its report was unfinished.
+
+**Resolution:** reject token-length termination and other incomplete/failed
+assistant endings rather than counting them as a completed review. Intermediate
+tool-use messages are not final reports. Provider failures, malformed JSON, and
+cleanup failures also remain errors.
+
+**Evidence:** the new regression failed before the correction and passed with the
+final focused suite. A failed reviewer did not establish that the design had no
+findings; the parent must report its failure instead.
+
+### Worktree did not include the original checkout's dirty changes
+
+**Observation:** this is the selected contract, not a synchronization bug.
+Worktrees start from HEAD so workers have a separate branch and edit area.
+
+**Resolution:** choose snapshot mode when current uncommitted source is required.
+Choose worktree mode when a clean committed starting point and retained branch are
+desired. Inspect the returned worker path on the host; review before applying
+changes. The extension does not commit or merge them automatically. Main repository
+Git metadata is deliberately unavailable inside the worker.
+
+**Evidence:** a live fixture kept its original dirty value unchanged while the
+worker changed and verified a different value in its own worktree. The branch
+still pointed to the original HEAD afterward.
+
+### Source or verification evidence became stale
+
+**Observation:** external edits and context compaction were exercised in tests.
+A saved pass or a previous read is not automatically evidence for current bytes.
+
+**Resolution:** reread source when its hash changes or its exact excerpt leaves
+active context; use `force:true` when exact text is needed again. Rerun an
+explicitly configured verification check after relevant source/config changes.
+Do not suppress stale warnings, restore older successes after a newer failure,
+or treat symbol summaries as inspected implementation.
+
+### Full repository checks remain blocked by unrelated AI catalog errors
+
+**Problem:** `npm run check` reported provider/catalog type mismatches and tests
+referencing obsolete model IDs. It also emitted an existing `min-release-age`
+configuration warning.
+
+**Status:** unresolved by this harness work. The focused suites and browser smoke
+passed, but they are not a replacement for a clean full-repository check. Those
+unrelated AI/configuration files were left untouched, and the user explicitly
+approved committing with the failures recorded. No Git hook was disabled or
+bypassed. Fix the catalog/configuration mismatch as a separate change before
+claiming that the full check is green.
+
+## 11. Evaluation specification: is it fruitful?
 
 Functional tests establish selected behavior, not improved coding performance.
 The primary objective is correct task completion; token usage is optimized subject
@@ -358,7 +537,7 @@ for this candidate. No reduction in end-to-end tokens, regression rate, or task
 failure rate is claimed. Retain a mechanism because observed correctness or
 quality-adjusted resource use improves, not because another harness advertises it.
 
-## 11. Deferred work and explicit non-goals
+## 12. Deferred work and explicit non-goals
 
 - Investigation Gate: require task-appropriate reproduction/evidence before edits
   without blocking legitimate feature development.
